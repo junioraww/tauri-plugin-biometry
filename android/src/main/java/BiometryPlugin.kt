@@ -2,6 +2,7 @@
 package app.tauri.biometry
 
 import android.app.Activity
+import android.app.KeyguardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -184,49 +185,33 @@ class BiometryPlugin(private val activity: Activity): Plugin(activity) {
         }
     }
 
-    /**
-     * Check the device's availability and type of biometric authentication.
-     */
     @Command
     fun status(invoke: Invoke) {
         val manager = BiometricManager.from(activity)
+        val keyguardManager = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val isDeviceSecure = keyguardManager?.isDeviceSecure == true
         val biometryResult = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+            manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
         } else {
             @Suppress("DEPRECATION")
             manager.canAuthenticate()
         }
         val ret = JSObject()
-
-        val available = biometryResult == BiometricManager.BIOMETRIC_SUCCESS
-        ret.put(
-            "isAvailable",
-            available
-        )
-
+        val available = biometryResult == BiometricManager.BIOMETRIC_SUCCESS || isDeviceSecure
+        ret.put("isAvailable", available)
         ret.put("biometryType", biometryTypes[0].type)
 
         if (!available) {
             var reason = ""
             when (biometryResult) {
-                BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> reason =
-                    "Biometry unavailable."
-                BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> reason =
-                    "Biometrics not enrolled."
-                BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> reason =
-                    "No biometric on this device."
-                BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> reason =
-                    "A security update is required."
-                BiometricManager.BIOMETRIC_ERROR_UNSUPPORTED -> reason =
-                    "Unsupported biometry."
-                BiometricManager.BIOMETRIC_STATUS_UNKNOWN -> reason =
-                    "Unknown biometry state."
+                BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> reason = "Biometry unavailable."
+                BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> reason = "Biometrics not enrolled."
+                BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> reason = "No biometric on this device."
+                BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> reason = "A security update is required."
+                BiometricManager.BIOMETRIC_ERROR_UNSUPPORTED -> reason = "Unsupported biometry."
+                else -> reason = "Unknown biometry state."
             }
-
-            var errorCode = biometryErrorCodeMap[biometryResult]
-            if (errorCode == null) {
-                errorCode = "biometryNotAvailable"
-            }
+            var errorCode = biometryErrorCodeMap[biometryResult] ?: "biometryNotAvailable"
             ret.put("error", reason)
             ret.put("errorCode", errorCode)
         }
@@ -234,98 +219,55 @@ class BiometryPlugin(private val activity: Activity): Plugin(activity) {
         invoke.resolve(ret)
     }
 
-    /**
-     * Prompt the user for biometric authentication.
-     */
     @Command
     fun authenticate(invoke: Invoke) {
-        val intent = Intent(
-            activity,
-            BiometryActivity::class.java
-        )
-        
         val args = invoke.parseArgs(AuthOptions::class.java)
+        val promptBuilder = BiometricPrompt.PromptInfo.Builder()
+            .setTitle(args.title ?: (biometryNameMap[biometryTypes[0]] ?: "Подтвердите личность"))
+            .setSubtitle(args.subtitle)
+            .setDescription(args.reason)
 
-        // Pass the options to the activity
-        intent.putExtra(
-            TITLE,
-            args.title ?: (biometryNameMap[biometryTypes[0]] ?: "")
-        )
-        intent.putExtra(SUBTITLE, args.subtitle)
-        intent.putExtra(REASON, args.reason)
-        intent.putExtra(CANCEL_TITLE, args.cancelTitle)
-        intent.putExtra(DEVICE_CREDENTIAL, args.allowDeviceCredential)
+        val manager = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val isSecure = manager?.isDeviceSecure == true
+        val allowDeviceCred = args.allowDeviceCredential && isSecure
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && allowDeviceCred) {
+            promptBuilder.setAllowedAuthenticators(
+                BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            )
+        } else if (allowDeviceCred) {
+            @Suppress("DEPRECATION")
+            promptBuilder.setDeviceCredentialAllowed(true)
+        } else {
+            promptBuilder.setNegativeButtonText(args.cancelTitle ?: "Отмена")
+        }
+
         args.confirmationRequired?.let {
-            intent.putExtra(CONFIRMATION_REQUIRED, it)
+            promptBuilder.setConfirmationRequired(it)
         }
 
-        val maxAttemptsConfig = args.maxAttemps
-        val maxAttempts = max(maxAttemptsConfig, 1)
-        intent.putExtra(MAX_ATTEMPTS, maxAttempts)
-        startActivityForResult(invoke, intent, "authenticateResult")
-    }
-
-    @ActivityCallback
-    private fun authenticateResult(invoke: Invoke, result: ActivityResult) {
-        val resultCode = result.resultCode
-
-        // If the system canceled the activity, we might get RESULT_CANCELED in resultCode.
-        // In that case return that immediately, because there won't be any data.
-        if (resultCode == Activity.RESULT_CANCELED) {
-            invoke.reject(
-                "The system canceled authentication",
-                biometryErrorCodeMap[BiometricPrompt.ERROR_CANCELED]
-            )
-            return
-        }
-
-        // Derive the prefix locally per call instead of relying on shared
-        // mutable state.
-        val prefix = "${activity.packageName}."
-
-        // Convert the string result type to an enum
-        val data = result.data
-        val resultTypeName = data?.getStringExtra(
-            prefix + RESULT_TYPE
-        )
-        if (resultTypeName == null) {
-            invoke.reject(
-                "Missing data in the result of the activity",
-                INVALID_CONTEXT_ERROR
-            )
-            return
-        }
-        val resultType = try {
-            BiometryResultType.valueOf(resultTypeName)
-        } catch (e: IllegalArgumentException) {
-            invoke.reject(
-                "Invalid data in the result of the activity",
-                INVALID_CONTEXT_ERROR
-            )
-            return
-        }
-        val errorCode = data.getIntExtra(
-            prefix + RESULT_ERROR_CODE,
-            0
-        )
-        var errorMessage = data.getStringExtra(
-            prefix + RESULT_ERROR_MESSAGE
-        )
-        when (resultType) {
-            BiometryResultType.SUCCESS -> invoke.resolve()
-            BiometryResultType.FAILURE ->         // Biometry was successfully presented but was not recognized
-                invoke.reject(errorMessage, BIOMETRIC_FAILURE)
-
-            BiometryResultType.ERROR -> {
-                // The user cancelled, the system cancelled, or some error occurred.
-                // If the user cancelled, errorMessage is the text of the "negative" button,
-                // which is not especially descriptive.
-                if (errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON) {
-                    errorMessage = "Cancel button was pressed"
+        val promptInfo = promptBuilder.build()
+        val executor: Executor = ContextCompat.getMainExecutor(activity)
+        val biometricPrompt = BiometricPrompt(
+            activity as FragmentActivity,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    invoke.resolve()
                 }
-                invoke.reject(errorMessage, biometryErrorCodeMap[errorCode])
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                    invoke.reject(errString.toString(), biometryErrorCodeMap[errorCode])
+                }
+
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                }
             }
-        }
+        )
+        biometricPrompt.authenticate(promptInfo)
     }
 
     internal enum class BiometryType(val type: Int) {
@@ -342,18 +284,20 @@ class BiometryPlugin(private val activity: Activity): Plugin(activity) {
             keyName,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
         )
-            .setKeySize(4096)
+            .setKeySize(2048)
             .setBlockModes(KeyProperties.BLOCK_MODE_ECB)
             .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
-            // SHA-256 = OAEP digest. SHA-1 is needed because AndroidKeyStore's
-            // MGF1 is wired to SHA-1 internally (see oaepSpec()).
             .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA1)
-            .setUserAuthenticationRequired(true)
-            .setInvalidatedByBiometricEnrollment(true)
 
-        // API 34+ requires MGF1 digests to be authorized separately from the
-        // OAEP digest — setDigests() no longer covers MGF1. Without this the
-        // keystore rejects the operation with INCOMPATIBLE_MGF_DIGEST.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setUserAuthenticationParameters(
+                0,
+                KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL
+            )
+        } else {
+            builder.setUserAuthenticationRequired(true)
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             builder.setMgf1Digests(KeyProperties.DIGEST_SHA1)
         }
@@ -513,12 +457,25 @@ class BiometryPlugin(private val activity: Activity): Plugin(activity) {
             val rsaCipher = Cipher.getInstance(RSA_CIPHER_CONFIG)
             rsaCipher.init(Cipher.DECRYPT_MODE, keyPair.getPrivate(), oaepSpec())
             
-            val promptInfo = BiometricPrompt.PromptInfo.Builder()
-                .setTitle(args.title ?: (biometryNameMap[biometryTypes[0]] ?: ""))
+            val promptBuilder = BiometricPrompt.PromptInfo.Builder()
+                .setTitle(args.title ?: (biometryNameMap[biometryTypes[0]] ?: "Разблокировка"))
                 .setSubtitle(args.subtitle)
                 .setDescription(args.reason)
-                .setNegativeButtonText(args.cancelTitle ?: "cancelTitle")
-                .build()
+
+            val manager = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            val isSecure = manager?.isDeviceSecure == true
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isSecure) {
+                promptBuilder.setAllowedAuthenticators(
+                    BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                )
+            } else if (isSecure) {
+                @Suppress("DEPRECATION")
+                promptBuilder.setDeviceCredentialAllowed(true)
+            } else {
+                promptBuilder.setNegativeButtonText(args.cancelTitle ?: "Отмена")
+            }
+            val promptInfo = promptBuilder.build()
             
             val executor: Executor = ContextCompat.getMainExecutor(activity)
             
